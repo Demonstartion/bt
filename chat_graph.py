@@ -5,6 +5,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from typing_extensions import Annotated, TypedDict
 from search_service import SearchService
+from datetime import datetime, timezone
 
 try:
     import google.generativeai as genai
@@ -27,6 +28,21 @@ except ImportError:
     ANTHROPIC_AVAILABLE = False
     anthropic = None
 
+def is_time_or_date_question(message: str) -> str:
+    msg = message.lower()
+    # Any "time now" or "current time" or "what time is it" style
+    if ("time" in msg and ("now" in msg or "current" in msg or "what" in msg)) or \
+       ("what is the time" in msg) or \
+       ("tell me the time" in msg) or \
+       ("current time" in msg):
+        return "time"
+    if ("date" in msg and ("now" in msg or "current" in msg or "what" in msg)) or \
+       ("what is the date" in msg) or \
+       ("today's date" in msg) or \
+       ("current date" in msg):
+        return "date"
+    return ""
+
 class ChatState(TypedDict):
     messages: Annotated[List[Any], add_messages]
     search_results: str
@@ -42,7 +58,7 @@ class ChatGraph:
         self.anthropic_client = None
         self._setup_llm_clients()
         self.graph = self._build_graph()
-    
+
     def _setup_llm_clients(self):
         try:
             if GENAI_AVAILABLE:
@@ -90,6 +106,12 @@ class ChatGraph:
         try:
             messages = state["messages"]
             user_message = self._extract_message_content(messages[-1]) if messages else ""
+            # Directly answer time/date questions, skip search
+            time_or_date = is_time_or_date_question(user_message)
+            if time_or_date:
+                state["should_search"] = False
+                state["time_or_date"] = time_or_date
+                return state
             context = (
                 f"{self.persona}\n"
                 f"Decide if you need to perform a web search to answer the following user question. "
@@ -105,10 +127,19 @@ class ChatGraph:
 
     async def _search_node(self, state: ChatState) -> ChatState:
         try:
-            if state["messages"]:
-                latest_message = self._extract_message_content(state["messages"][-1])
-            else:
-                latest_message = ""
+            messages = state["messages"]
+            latest_message = self._extract_message_content(messages[-1]) if messages else ""
+            time_or_date = state.get("time_or_date") or is_time_or_date_question(latest_message)
+            if time_or_date == "time":
+                now = datetime.now(timezone.utc)
+                state["search_results"] = f"The current server time is {now.strftime('%Y-%m-%d %H:%M:%S UTC')}."
+                state["final_response"] = state["search_results"]
+                return state
+            elif time_or_date == "date":
+                now = datetime.now(timezone.utc)
+                state["search_results"] = f"Today's date is {now.strftime('%Y-%m-%d')} (UTC)."
+                state["final_response"] = state["search_results"]
+                return state
             search_results = await self.search_service.search(latest_message)
             state["search_results"] = search_results
             logging.info(f"Search performed for: {latest_message}")
@@ -122,6 +153,10 @@ class ChatGraph:
             messages = state["messages"]
             search_results = state.get("search_results", "")
             user_message = self._extract_message_content(messages[-1]) if messages else ""
+            # If we already have a direct time/date answer, use it
+            if state.get("time_or_date") in ("time", "date") and search_results:
+                state["final_response"] = search_results
+                return state
             base_context = (
                 f"{self.persona} "
                 f"If search results are provided, prefer using them to provide the most accurate and recent information.\n"
@@ -242,6 +277,10 @@ class ChatGraph:
         state = await self._should_search_node(state)
         if state.get("should_search"):
             state = await self._search_node(state)
+        elif state.get("time_or_date"):  # Time/date question shortcut
+            state = await self._search_node(state)
+            yield state["final_response"]
+            return
         # Now stream the generation
         search_results = state.get("search_results", "")
         user_message = self._extract_message_content(messages[-1])
@@ -258,20 +297,17 @@ class ChatGraph:
             role = "user" if i % 2 == 0 else "assistant"
             formatted_history.append({"role": role, "content": content})
         if self.model.startswith("gpt") and self.openai_client:
-            # Stream OpenAI
             async for chunk in self._stream_openai(base_context, formatted_history):
                 yield chunk
         elif self.model.startswith("gemini") and GENAI_AVAILABLE:
             async for chunk in self._stream_gemini(base_context, formatted_history):
                 yield chunk
         else:
-            # Fallback: not streaming, just yield full response
             response = await self._call_llm(base_context, formatted_history)
             async for chunk in response:
                 yield chunk
 
     def _stream_openai(self, prompt, chat_history):
-        # OpenAI streaming (sync generator, since Quart expects async, wrap in async if needed)
         import asyncio
         async def inner():
             messages = [{"role": "system", "content": self.persona or "You are a helpful customer service AI."}]
