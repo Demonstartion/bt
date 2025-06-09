@@ -1,0 +1,8 @@
+runtime: python311
+
+entrypoint: gunicorn -b :$PORT main:app
+
+env_variables:
+  FLASK_SECRET_KEY: "76"
+  OPENAI_API_KEY: "sk-"
+  GOOGLE_API_KEY: ""
