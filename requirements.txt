@@ -1,4 +1,5 @@
-flask
+quart
+uvicorn
 langchain
 langchain-google-genai
 langchain-google-vertexai
